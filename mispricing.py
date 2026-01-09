@@ -1,69 +1,132 @@
-import yaml
-import requests
-import argparse
+# field_bot_min.py
+import time, math, sqlite3, hashlib
+from dataclasses import dataclass
+from typing import Dict
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+DB = "field.db"
+POLL = 180
+NOTIFY_THRESHOLD = 0.7
+DECAY = 0.05          # daily decay toward 0
+STEP = 0.08           # bounded update
+COOLDOWN = 3600
 
-def load_config():
-    with open("config.yaml", "r") as f:
-        return yaml.safe_load(f)
+# ---------- model ----------
 
-def extract_items(source):
-    r = requests.get(source["url"], headers=HEADERS, timeout=20)
-    r.raise_for_status()
+@dataclass
+class Item:
+    source: str
+    id: str
+    title: str
+    price: float | None
+    created_ts: float
 
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"URL did not return JSON: {source['url']}")
+# ---------- utils ----------
 
-    items = data
-    for part in source["list_path"].split("."):
-        items = items[part]
+def now(): return time.time()
+def clamp(x,a,b): return max(a,min(b,x))
+def sig(x): return 1/(1+math.exp(-x))
 
-    results = {}
-    for item in items:
-        title = item
-        for part in source["title_field"].split("."):
-            title = title[part]
+# ---------- db ----------
 
-        price = item
-        for part in source["price_field"].split("."):
-            price = price[int(part)] if part.isdigit() else price[part]
+def db():
+    c = sqlite3.connect(DB)
+    c.execute("PRAGMA journal_mode=WAL;")
+    return c
 
-        results[title.lower()] = float(price)
+def init():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS w(k TEXT PRIMARY KEY,v REAL,t REAL);
+        CREATE TABLE IF NOT EXISTS cd(k TEXT PRIMARY KEY,u REAL);
+        CREATE TABLE IF NOT EXISTS seen(s TEXT,i TEXT,PRIMARY KEY(s,i));
+        """)
 
-    return results
+def weight(k):
+    with db() as c:
+        r = c.execute("SELECT v,t FROM w WHERE k=?", (k,)).fetchone()
+        if not r: return 0.0
+        v,t = r
+        days = (now()-t)/86400
+        return v*((1-DECAY)**max(days,0))
 
-def run_detector(det):
-    a = extract_items(det["params"]["source_a"])
-    b = extract_items(det["params"]["source_b"])
+def set_weight(k,v):
+    with db() as c:
+        c.execute(
+            "INSERT INTO w VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=?,t=?",
+            (k,v,now(),v,now())
+        )
 
-    for title in set(a) & set(b):
-        pa, pb = a[title], b[title]
-        low, high = min(pa, pb), max(pa, pb)
+def cooldown(k):
+    with db() as c:
+        r = c.execute("SELECT u FROM cd WHERE k=?", (k,)).fetchone()
+        return r and now()<r[0]
 
-        abs_profit = high - low
-        roi = abs_profit / low if low > 0 else 0
+def set_cd(k):
+    with db() as c:
+        c.execute(
+            "INSERT INTO cd VALUES(?,?) ON CONFLICT(k) DO UPDATE SET u=?",
+            (k,now()+COOLDOWN,now()+COOLDOWN)
+        )
 
-        if abs_profit >= det["params"]["min_abs_profit"] and roi >= det["params"]["min_roi"]:
-            print(
-                f"[ALERT] {title} | buy {low:.2f} sell {high:.2f} "
-                f"| profit {abs_profit:.2f} ROI {roi:.2%}"
-            )
+def seen(item):
+    with db() as c:
+        r = c.execute("SELECT 1 FROM seen WHERE s=? AND i=?", (item.source,item.id)).fetchone()
+        if r: return True
+        c.execute("INSERT INTO seen VALUES(?,?)", (item.source,item.id))
+        return False
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", default="long")
-    parser.add_argument("--once", action="store_true")
-    args = parser.parse_args()
+# ---------- field logic ----------
 
-    cfg = load_config()
-    for det in cfg["detectors"]:
-        if det.get("enabled"):
-            run_detector(det)
+def keys(item: Item) -> Dict[str,str]:
+    major = item.title.lower().split()[0] if item.title else "x"
+    return {
+        "src": f"s:{item.source}",
+        "maj": f"m:{major}",
+    }
+
+def base_exc(item: Item) -> float:
+    b = 0.0
+    if item.price is not None:
+        b += clamp(1/(1+item.price),0,0.25)
+    age_h = (now()-item.created_ts)/3600
+    b += clamp(math.exp(-age_h/12)*0.25,0,0.25)
+    return b
+
+def excitation(item: Item) -> float:
+    x = base_exc(item)
+    damp = 1.0
+    for k in keys(item).values():
+        if cooldown(k): damp *= 0.5
+        x += clamp(weight(k), -0.35, 0.35)
+    return clamp(sig(3*(x-0.35))*damp,0,1)
+
+# ---------- outcomes ----------
+
+def outcome(item: Item, win: bool):
+    for k in keys(item).values():
+        w = weight(k)
+        if win:
+            set_weight(k, clamp(w+STEP,-1,1))
+        else:
+            set_weight(k, clamp(w-STEP,-1,1))
+            set_cd(k)
+
+# ---------- loop ----------
+
+def fetch_items():  # REPLACE with real source
+    t = now()
+    return [Item("demo", hashlib.md5(str(int(t//600)).encode()).hexdigest(),
+                 "digital asset !!!", 9.0, t-1800)]
+
+def run():
+    init()
+    while True:
+        for it in fetch_items():
+            if seen(it): continue
+            exc = excitation(it)
+            if exc >= NOTIFY_THRESHOLD:
+                print(f"[NOTIFY] exc={exc:.2f} {it.title}")
+        time.sleep(POLL)
 
 if __name__ == "__main__":
-    main()
+    run()
