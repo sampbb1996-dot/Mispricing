@@ -1,3 +1,4 @@
+print("mispricing.py started", flush=True)
 # field_bot_min.py
 import time, math, sqlite3, hashlib
 from dataclasses import dataclass
