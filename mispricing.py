@@ -9,10 +9,13 @@ from typing import Dict
 
 DB = "field.db"
 
-POLL_SECONDS = 180          # scan cadence
-DECAY = 0.03                # slow drift back to neutral
-STEP = 0.12                 # bounded update per observation
-SIGNAL_THRESHOLD = 0.55     # notify when |score| exceeds this
+POLL_SECONDS = 180
+
+# --- dynamics ---
+STEP = 0.12                 # max update per observation
+DECAY = 0.02                # natural decay
+INACTION_PENALTY = 0.015    # cost of doing nothing
+SIGNAL_THRESHOLD = 0.55
 
 # -------------------- model --------------------
 
@@ -29,11 +32,6 @@ class Item:
         return h.hexdigest()
 
     def error(self) -> float:
-        """
-        Signed relative mispricing.
-        Positive = cheap
-        Negative = expensive
-        """
         if self.ref_price <= 0:
             return 0.0
         return (self.ref_price - self.price) / self.ref_price
@@ -47,14 +45,15 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS field (
             key TEXT PRIMARY KEY,
-            score REAL NOT NULL
+            score REAL NOT NULL,
+            updated INTEGER NOT NULL
         )
     """)
     con.commit()
     con.close()
 
 
-def load_scores() -> Dict[str, float]:
+def load_field() -> Dict[str, float]:
     con = sqlite3.connect(DB)
     cur = con.cursor()
     cur.execute("SELECT key, score FROM field")
@@ -63,95 +62,76 @@ def load_scores() -> Dict[str, float]:
     return {k: v for k, v in rows}
 
 
-def save_score(key: str, score: float):
+def save_field(field: Dict[str, float]):
+    now = int(time.time())
     con = sqlite3.connect(DB)
     cur = con.cursor()
-    cur.execute("""
-        INSERT INTO field (key, score)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET score=excluded.score
-    """, (key, score))
+    for k, v in field.items():
+        cur.execute(
+            "INSERT OR REPLACE INTO field (key, score, updated) VALUES (?, ?, ?)",
+            (k, v, now)
+        )
     con.commit()
     con.close()
 
 
-# -------------------- governor --------------------
+# -------------------- update logic --------------------
 
-def update_score(prev: float, err: float) -> float:
+def update_score(prev: float, signal: float | None) -> float:
     """
-    Error-governor update.
-
-    • No notion of correctness
-    • False signals still move the field
-    • Bounded, damped, symmetric
+    Zero / inaction is a liability.
+    Absence of signal causes negative drift.
     """
 
-    # compress error (no blow-ups)
-    e = math.tanh(err)
+    # bounded signal contribution
+    delta = 0.0
+    if signal is not None:
+        delta = max(-STEP, min(STEP, signal))
 
-    # bounded step
-    delta = STEP * e
+    # decay always applies
+    prev *= (1 - DECAY)
 
-    # decay toward neutral
-    next_score = prev * (1 - DECAY) + delta
+    # inaction penalty if no meaningful signal
+    if signal is None or abs(signal) < 1e-6:
+        prev -= INACTION_PENALTY
 
-    # hard clamp
+    # apply signal
+    next_score = prev + delta
+
+    # clamp to stability bounds
     return max(-1.0, min(1.0, next_score))
-
-
-# -------------------- signal --------------------
-
-def maybe_notify(item: Item, score: float):
-    if abs(score) >= SIGNAL_THRESHOLD:
-        side = "CHEAP" if score > 0 else "EXPENSIVE"
-        print(
-            f"[SIGNAL] {item.source} {item.item_id} "
-            f"{side} | score={score:.2f}",
-            flush=True
-        )
-
-
-# -------------------- example scan --------------------
-# Replace this with real marketplace scraping
-
-def scan_market() -> list[Item]:
-    """
-    Dummy scan to prove the system emits signals immediately.
-    """
-    return [
-        Item("demo", "A", price=70, ref_price=120),
-        Item("demo", "B", price=105, ref_price=100),
-        Item("demo", "C", price=40, ref_price=90),
-    ]
 
 
 # -------------------- main loop --------------------
 
 def main():
     init_db()
-    scores = load_scores()
+    field = load_field()
 
-    print("scan tick", flush=True)
+    while True:
+        observations: list[Item] = get_observations()  # ← your existing source logic
 
-    items = scan_market()
+        touched = set()
 
-    for item in items:
-        key = item.key()
-        prev = scores.get(key, 0.0)
-        err = item.error()
+        for item in observations:
+            k = item.key()
+            signal = item.error()
+            prev = field.get(k, 0.0)
 
-        score = update_score(prev, err)
-        save_score(key, score)
+            field[k] = update_score(prev, signal)
+            touched.add(k)
 
-        maybe_notify(item, score)
+            if abs(field[k]) >= SIGNAL_THRESHOLD:
+                notify(item, field[k])  # unchanged
 
-    print("scan complete", flush=True)
+        # apply inaction penalty to untouched entries
+        for k, prev in field.items():
+            if k not in touched:
+                field[k] = update_score(prev, None)
+
+        save_field(field)
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:
-            print("error:", e, flush=True)
-        time.sleep(POLL_SECONDS)
+    main()
